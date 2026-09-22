@@ -634,6 +634,7 @@ def attention_with_output_extra_kwargs(
         "v_descale",
         "mxfp8_norm_rope_positions",
         "mxfp8_norm_rope_temp_scale",
+        "topk_indices",
     ):
         t = kwargs.get(per_token_key)
         if t is not None:

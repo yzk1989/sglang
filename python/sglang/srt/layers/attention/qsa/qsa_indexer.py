@@ -22,6 +22,9 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -80,6 +83,44 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+        self._bcg_prefill_topk_backing_buffers = {}
+        self._bcg_prefill_topk_buffer_views = {}
+
+    def get_bcg_prefill_topk_buffer(
+        self, rows: int, device: torch.device
+    ) -> torch.Tensor:
+        """Return a stable BCG bridge view backed by one buffer per device."""
+        rows = int(rows)
+        device = torch.device(device)
+        view_key = (rows, device)
+        output = self._bcg_prefill_topk_buffer_views.get(view_key)
+        if output is not None:
+            return output
+
+        backing = self._bcg_prefill_topk_backing_buffers.get(device)
+        if backing is None:
+            # Allocate the largest configured bucket on the first capture. All
+            # smaller bucket outputs then share this storage instead of keeping
+            # one large allocation alive per QSA layer and per bucket.
+            from sglang.srt.runtime_context import get_server_args
+
+            capture_rows = get_server_args().cuda_graph_bs_prefill or []
+            max_rows = max(rows, *capture_rows)
+            backing = torch.empty(
+                (max_rows, self.token_topk + self.compress_ratio - 1),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._bcg_prefill_topk_backing_buffers[device] = backing
+        elif rows > backing.shape[0]:
+            raise ValueError(
+                "QSA BCG top-k rows exceed the configured prefill graph bucket: "
+                f"rows={rows}, max_rows={backing.shape[0]}"
+            )
+
+        output = backing[:rows]
+        self._bcg_prefill_topk_buffer_views[view_key] = output
+        return output
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -157,6 +198,7 @@ class QSAIndexer(MultiPlatformOp):
         pool=None,
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
+        rope_cache_length: int | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
@@ -176,7 +218,9 @@ class QSAIndexer(MultiPlatformOp):
                 self.rotary_emb, "_ensure_cos_sin_cache_length"
             ):
                 self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
+                    rope_cache_length
+                    if rope_cache_length is not None
+                    else int(positions.max().item())
                 )
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
@@ -199,16 +243,23 @@ class QSAIndexer(MultiPlatformOp):
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
         )
-        q = self.apply_rope(positions, q)
+        q = self.apply_rope(positions, q, rope_cache_length=rope_cache_length)
         return q, token_k, False
 
     def normalize_compressed_keys(
-        self, compressed_keys: torch.Tensor, block_positions: torch.Tensor
+        self,
+        compressed_keys: torch.Tensor,
+        block_positions: torch.Tensor,
+        rope_cache_length: int | None = None,
     ) -> torch.Tensor:
         normalized = self.k_layernorm(
             compressed_keys.reshape(-1, self.index_head_dim)
         ).reshape(-1, self.index_kv_heads, self.index_head_dim)
-        return self.apply_rope(block_positions, normalized)
+        return self.apply_rope(
+            block_positions,
+            normalized,
+            rope_cache_length=rope_cache_length,
+        )
 
     def _use_fused_compress(self, pool) -> bool:
         return getattr(
@@ -283,6 +334,7 @@ class QSAIndexer(MultiPlatformOp):
         metadata,
         state_slots: torch.Tensor | None = None,
         state_stored: bool = False,
+        rope_cache_length: int | None = None,
     ) -> None:
         """Store the pending-group ring and compress each completed group."""
 
@@ -353,7 +405,11 @@ class QSAIndexer(MultiPlatformOp):
         compressed_rope_positions = self._rope_from_matrix(
             source_rope[group_locs[:, 0]]
         )
-        normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
+        normalized = self.normalize_compressed_keys(
+            pooled,
+            compressed_rope_positions,
+            rope_cache_length=rope_cache_length,
+        )
         pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
 
     def _compress_decode_cuda_graph(self, metadata) -> None:
@@ -389,7 +445,12 @@ class QSAIndexer(MultiPlatformOp):
             return positions[0]
         return positions
 
-    def apply_rope(self, positions: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+    def apply_rope(
+        self,
+        positions: torch.Tensor,
+        tensor: torch.Tensor,
+        rope_cache_length: int | None = None,
+    ) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor
         positions = positions.long()
@@ -401,7 +462,11 @@ class QSAIndexer(MultiPlatformOp):
         if not get_is_capture_mode() and hasattr(
             self.rotary_emb, "_ensure_cos_sin_cache_length"
         ):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+            self.rotary_emb._ensure_cos_sin_cache_length(
+                rope_cache_length
+                if rope_cache_length is not None
+                else int(positions.max().item())
+            )
 
         # position_cos/position_sin repeat cos/sin to the full rotary width;
         # apply_rotary_emb consumes one half.
@@ -432,10 +497,14 @@ class QSAIndexer(MultiPlatformOp):
         sequence_lengths_for_rows: torch.Tensor,
     ) -> torch.Tensor:
         rows = q.shape[0]
-        output = torch.empty(
-            (rows, self.token_topk + self.compress_ratio - 1),
-            dtype=torch.int32,
-            device=q.device,
+        output = (
+            self.get_bcg_prefill_topk_buffer(rows, q.device)
+            if is_in_breakable_cuda_graph()
+            else torch.empty(
+                (rows, self.token_topk + self.compress_ratio - 1),
+                dtype=torch.int32,
+                device=q.device,
+            )
         )
         if rows == 0:
             return output
@@ -578,6 +647,7 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
+        rope_cache_length = indexer_metadata.prefill_rope_cache_length or None
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
@@ -589,6 +659,7 @@ class QSAIndexer(MultiPlatformOp):
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
+            rope_cache_length=rope_cache_length,
         )
         self.update_key_state_and_compress(
             token_k,
@@ -597,6 +668,7 @@ class QSAIndexer(MultiPlatformOp):
             indexer_metadata,
             state_slots=state_slots,
             state_stored=state_stored,
+            rope_cache_length=rope_cache_length,
         )
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (

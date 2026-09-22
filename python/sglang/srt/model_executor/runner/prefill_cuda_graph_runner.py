@@ -784,12 +784,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if embeds_name in kwargs:
                             kwargs[embeds_name] = None
                             break
-                return self.layer_model.forward(
+                output = self.layer_model.forward(
                     input_ids,
                     positions,
                     forward_batch,
                     **kwargs,
                 )
+                side_hidden_states = getattr(
+                    self.layer_model, "last_hc_hidden_states", None
+                )
+                if side_hidden_states is not None:
+                    return output, side_hidden_states
+                return output
             # tc_piecewise: compile/capture the outer model.forward path.
             pp_kwargs = self.model_runner._pp_kwargs(pp_proxy_tensors)
             return self.model_runner.model.forward(
@@ -1895,14 +1901,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     if registry.has_slot(name):
                         registry.get_slot(name).buffer[bs:r].zero_()
 
-        # Refresh the static buffer the captured graph reads from.
+        # Target BCG output can contain only live rows while input_ids is already
+        # padded to this draft graph's bucket. Keep padding deterministic.
         if (
             self.static_draft_hidden_states is not None
             and forward_batch.spec_info is not None
         ):
-            self.static_draft_hidden_states[:num_tokens].copy_(
-                forward_batch.spec_info.hidden_states
-            )
+            hidden_states = forward_batch.spec_info.hidden_states
+            live_num_tokens = hidden_states.shape[0]
+            if (
+                hidden_states.ndim != 2
+                or live_num_tokens > static_num_tokens
+                or hidden_states.shape[1] != self.static_draft_hidden_states.shape[1]
+            ):
+                raise RuntimeError(
+                    "Draft hidden states do not fit the selected prefill CUDA "
+                    f"graph bucket: hidden={tuple(hidden_states.shape)}, "
+                    f"bucket={tuple(self.static_draft_hidden_states[:static_num_tokens].shape)}"
+                )
+            self.static_draft_hidden_states[:static_num_tokens].zero_()
+            self.static_draft_hidden_states[:live_num_tokens].copy_(hidden_states)
 
         metadata_forward_batch = forward_batch
         if self.enable_cp_bcg_capture:
@@ -1967,6 +1985,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self.buffer_registry.has_slot("input_embeds"):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
+            if (
+                isinstance(hs, tuple)
+                and len(hs) == 2
+                and hasattr(self.layer_model, "last_hc_hidden_states")
+            ):
+                hs, self.layer_model.last_hc_hidden_states = hs
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
 
         original_layer_forward = self.layer_model.forward

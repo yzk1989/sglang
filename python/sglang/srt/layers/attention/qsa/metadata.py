@@ -14,6 +14,68 @@ import torch
 from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
 
 
+def build_qsa_prefill_compressed_locs(
+    token_slot_table: torch.Tensor,
+    sequence_lengths_cpu: torch.Tensor,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Build the packed compressed-cache locations once per prefill batch."""
+
+    if sequence_lengths_cpu.device.type != "cpu":
+        raise ValueError("QSA prefill sequence lengths must already be on CPU")
+    if sequence_lengths_cpu.numel() > token_slot_table.shape[0]:
+        raise ValueError(
+            "QSA prefill sequence lengths exceed token-slot rows: "
+            f"lengths={sequence_lengths_cpu.numel()}, "
+            f"rows={token_slot_table.shape[0]}"
+        )
+
+    parts = []
+    for sequence_id, sequence_length in enumerate(sequence_lengths_cpu.tolist()):
+        complete_blocks = int(sequence_length) // compress_ratio
+        if complete_blocks == 0:
+            continue
+        parts.append(
+            token_slot_table[
+                sequence_id, : complete_blocks * compress_ratio : compress_ratio
+            ].long()
+            // compress_ratio
+        )
+
+    if not parts:
+        return torch.empty(0, dtype=torch.long, device=token_slot_table.device)
+    if len(parts) == 1:
+        return parts[0]
+    return torch.cat(parts, dim=0)
+
+
+def build_qsa_prefill_kv_locs(
+    token_slot_table: torch.Tensor,
+    sequence_lengths_cpu: torch.Tensor,
+) -> torch.Tensor:
+    """Build packed full-KV cache locations once per prefill batch."""
+
+    if sequence_lengths_cpu.device.type != "cpu":
+        raise ValueError("QSA prefill sequence lengths must already be on CPU")
+    if sequence_lengths_cpu.numel() > token_slot_table.shape[0]:
+        raise ValueError(
+            "QSA prefill sequence lengths exceed token-slot rows: "
+            f"lengths={sequence_lengths_cpu.numel()}, "
+            f"rows={token_slot_table.shape[0]}"
+        )
+
+    parts = [
+        token_slot_table[sequence_id, : int(sequence_length)].long()
+        for sequence_id, sequence_length in enumerate(sequence_lengths_cpu.tolist())
+        if int(sequence_length) > 0
+    ]
+    if not parts:
+        return torch.empty(0, dtype=torch.long, device=token_slot_table.device)
+    if len(parts) == 1:
+        return parts[0]
+    return torch.cat(parts, dim=0)
+
+
 def build_qsa_row_ranges(
     sequence_lengths: torch.Tensor,
     query_positions: torch.Tensor,
@@ -67,10 +129,20 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_ratio: int
     block_topk: int
     req_pool_indices: Optional[torch.Tensor] = None
-    # Parallel per-group arrays for the groups compressed this forward:
-    # slot, sequence-local group-end position, and owning metadata row.
-    # The first member's token row in this forward's packed tensors is extend only,
-    # where group-aligned chunks keep every member in-chunk; None on paged forwards.
+    # CPU-derived upper bound used to grow the RoPE cache without reading a
+    # GPU position scalar in every QSA layer during breakable-graph replay.
+    prefill_rope_cache_length: int = 0
+    # Packed cache locations are independent of layer weights. Prefill builds
+    # them once per batch so all QSA layers avoid repeating host synchronization
+    # and dynamic concatenation in the indexer hot path.
+    prefill_compressed_locs: Optional[torch.Tensor] = None
+    # One entry per compressed group to (re)write this forward: the
+    # slot, the group-end token position (sequence-local) and the metadata
+    # row owning it. For extend forwards, compress_member_rows additionally
+    # holds each group's first member as a token-row index into this
+    # forward's packed tensors (extend chunks are group-aligned, so every
+    # member is in-chunk); paged forwards leave it None and source members
+    # from the per-request pending ring instead.
     write_locs: Optional[torch.Tensor] = None
     compress_group_positions: Optional[torch.Tensor] = None
     compress_sequence_ids: Optional[torch.Tensor] = None
@@ -126,31 +198,20 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         """Gather packed compressed K and ragged ranges for prefill MQA."""
 
         pool = self.token_to_kv_pool
-        ratio = self.compress_ratio
         compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
-        parts = []
-        sequence_lengths = self.sequence_lengths.to(torch.int32)
-        sequence_lengths_list = sequence_lengths.tolist()
-        for sequence_id in range(len(sequence_lengths_list)):
-            complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
-            if complete_blocks == 0:
-                continue
-            # compressed slot = first raw slot // ratio; the allocator is page-aligned,
-            # so each group is contiguous in one page (see QSATokenToKVPool).
-            compressed_locs = (
-                self.token_slot_table[
-                    sequence_id, : complete_blocks * ratio : ratio
-                ].long()
-                // ratio
-            )
-            parts.append(compressed_buffer.index_select(0, compressed_locs))
+        compressed_locs = self.prefill_compressed_locs
+        if compressed_locs is None:
+            raise RuntimeError("QSA prefill compressed locations are not initialized")
         compressed_keys = (
-            torch.cat(parts, dim=0)
-            if parts
+            compressed_buffer.index_select(0, compressed_locs)
+            if compressed_locs.numel()
             else compressed_buffer.new_empty(
                 (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
             )
         )
+        sequence_lengths = self.sequence_lengths
+        if sequence_lengths.dtype != torch.int32:
+            sequence_lengths = sequence_lengths.to(torch.int32)
         num_valid_tokens = self.token_to_batch_idx.numel()
         if positions.numel() < num_valid_tokens:
             raise ValueError(

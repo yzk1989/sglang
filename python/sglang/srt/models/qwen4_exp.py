@@ -53,6 +53,12 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
@@ -75,6 +81,42 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+
+def _qsa_indexer_prefill_eager(
+    indexer: nn.Module,
+    layer_id: int,
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Run the dynamic QSA prefill indexer outside BCG graph segments."""
+    from sglang.srt.layers.attention.qsa.glue import get_qsa_indexer_metadata
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        get_tc_piecewise_forward_context,
+    )
+
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    metadata = get_qsa_indexer_metadata(get_attn_backend(), layer_id, forward_batch)
+    topk_indices = indexer(hidden_states, positions, forward_batch, metadata)
+    if topk_indices.shape[0] == hidden_states.shape[0]:
+        return topk_indices
+
+    if topk_indices.shape[0] > hidden_states.shape[0]:
+        raise ValueError(
+            "QSA BCG top-k rows exceed the captured token bucket: "
+            f"topk={topk_indices.shape[0]}, bucket={hidden_states.shape[0]}"
+        )
+    padded = indexer.get_bcg_prefill_topk_buffer(
+        hidden_states.shape[0], hidden_states.device
+    )
+    padded[: topk_indices.shape[0]].copy_(topk_indices)
+    padded[topk_indices.shape[0] :].fill_(-1)
+    return padded
+
+
+# QSA prefill builds variable-length compressed-key lists and reads sequence
+# lengths on the host. Keep that work eager between captured BCG segments.
+_bcg_qsa_indexer_prefill_eager = eager_on_graph(True)(_qsa_indexer_prefill_eager)
 
 
 def _ple_table_is_fp8(
@@ -1512,6 +1554,10 @@ class Qwen4ExpAttentionDecoderLayer(
             # selection; the indexer never runs inside the decode graph.
             return sparse_backend.lookup_mtp_sparse_indices(
                 forward_batch, self.layer_id
+            )
+        if is_in_breakable_cuda_graph() and forward_batch.forward_mode.is_extend():
+            return _bcg_qsa_indexer_prefill_eager(
+                self.indexer, self.layer_id, hidden_states, positions
             )
         indexer_metadata = get_qsa_indexer_metadata(
             backend, self.layer_id, forward_batch

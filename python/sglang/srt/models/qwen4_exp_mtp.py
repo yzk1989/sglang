@@ -52,6 +52,10 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         self.pp_group = get_parallel().pp_group
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
+        # MTP fusion preserves all hyper-connection lanes, so the tensor passed
+        # into Qwen4ExpModel is wider than the token embedding. Prefill CUDA
+        # graphs use this declaration to size their static transformer input.
+        self.input_embeds_hidden_size = self.hc_count * self.hidden_size
         self._mtp_input_fusion = self._init_mtp_input_fusion(config)
 
         self.model = Qwen4ExpModel(

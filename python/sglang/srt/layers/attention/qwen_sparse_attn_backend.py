@@ -26,6 +26,8 @@ from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     build_group_ring_slots,
     build_pending_ring_slots,
+    build_qsa_prefill_compressed_locs,
+    build_qsa_prefill_kv_locs,
     build_rope_position_matrix,
     compressed_decode_view,
 )
@@ -106,6 +108,12 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     fa2_valid_counts: Optional[torch.Tensor] = None
     fa2_cu_seqlens_k: Optional[torch.Tensor] = None
     fa2_cu_seqlens_q: Optional[torch.Tensor] = None
+    prefill_kv_locs: Optional[torch.Tensor] = None
+    prefill_cu_seqlens_k: Optional[torch.Tensor] = None
+    prefill_cu_seqlens_q: Optional[torch.Tensor] = None
+    prefill_max_sequence_length: int = 0
+    prefill_max_query_length: int = 0
+    prefill_has_prefix: bool = False
 
 
 class QSAMTPSharedSparseIndices:
@@ -635,6 +643,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         pending_ring_slots = None
         compress_group_ring_locs = None
         extend_rope_matrix = None
+        prefill_compressed_locs = None
+        prefill_kv_locs = None
+        prefill_cu_seqlens_k = None
+        prefill_cu_seqlens_q = None
+        prefill_max_sequence_length = 0
+        prefill_max_query_length = 0
+        prefill_has_prefix = False
         write_locs, group_positions, group_sequence_ids, group_member_rows = (
             self._qsa_build_write_plan(
                 forward_batch=forward_batch,
@@ -692,6 +707,44 @@ class QwenSparseAttnBackend(AttentionBackend):
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
                     )
+        if not decode_like:
+            sequence_lengths_cpu = forward_batch.seq_lens_cpu
+            if sequence_lengths_cpu is None:
+                sequence_lengths_cpu = sequence_lengths.detach().cpu()
+            else:
+                sequence_lengths_cpu = self._as_cpu_int_tensor(
+                    sequence_lengths_cpu, sequence_lengths.numel()
+                )
+            prefill_compressed_locs = build_qsa_prefill_compressed_locs(
+                token_slot_table=token_slot_table,
+                sequence_lengths_cpu=sequence_lengths_cpu,
+                compress_ratio=self.compress_ratio,
+            )
+            prefill_kv_locs = build_qsa_prefill_kv_locs(
+                token_slot_table=token_slot_table,
+                sequence_lengths_cpu=sequence_lengths_cpu,
+            )
+            extend_lengths_cpu = forward_batch.extend_seq_lens_cpu
+            if extend_lengths_cpu is None:
+                extend_lengths_cpu = forward_batch.extend_seq_lens.detach().cpu()
+            else:
+                extend_lengths_cpu = self._as_cpu_int_tensor(
+                    extend_lengths_cpu, sequence_lengths.numel()
+                )
+            prefill_has_prefix = bool(
+                (sequence_lengths_cpu - extend_lengths_cpu).ne(0).any()
+            )
+            prefill_max_sequence_length = int(sequence_lengths_cpu.max().item())
+            prefill_max_query_length = int(extend_lengths_cpu.max().item())
+            prefill_cu_seqlens_k = F.pad(
+                sequence_lengths.cumsum(0), (1, 0)
+            ).contiguous()
+            prefill_cu_seqlens_q = F.pad(
+                forward_batch.extend_seq_lens.to(
+                    sequence_lengths.device, dtype=torch.int32
+                ).cumsum(0),
+                (1, 0),
+            ).contiguous()
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
@@ -701,6 +754,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             compress_ratio=self.token_to_kv_pool.qsa_compress_ratio,
             block_topk=self.token_to_kv_pool.qsa_block_topk,
             req_pool_indices=row_req_pool_indices,
+            prefill_rope_cache_length=prefill_max_sequence_length,
+            prefill_compressed_locs=prefill_compressed_locs,
             write_locs=write_locs,
             compress_group_positions=group_positions,
             compress_sequence_ids=group_sequence_ids,
@@ -718,6 +773,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
+            prefill_kv_locs=prefill_kv_locs,
+            prefill_cu_seqlens_k=prefill_cu_seqlens_k,
+            prefill_cu_seqlens_q=prefill_cu_seqlens_q,
+            prefill_max_sequence_length=prefill_max_sequence_length,
+            prefill_max_query_length=prefill_max_query_length,
+            prefill_has_prefix=prefill_has_prefix,
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -1305,21 +1366,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             return self._pad_extend_output(output, num_output_rows)
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
-        extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
-        sequence_lens = [int(x) for x in forward_batch.seq_lens_cpu]
-        prefix_lens = [
-            sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
-        ]
-        cu_seqlens_q = F.pad(
-            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
-            (1, 0),
-        ).contiguous()
-        if not any(prefix_lens):
+        metadata = self._resolve_metadata(forward_batch)
+        cu_seqlens_q = metadata.prefill_cu_seqlens_q
+        if cu_seqlens_q is None:
+            raise RuntimeError("QSA prefill query metadata is not initialized")
+        if not metadata.prefill_has_prefix:
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
                 k[:num_valid_rows].contiguous(),
                 v[:num_valid_rows].contiguous(),
-                max(sequence_lens, default=1),
+                max(metadata.prefill_max_sequence_length, 1),
                 topk_indices,
                 cu_seqlens_q,
                 layer.scaling,
@@ -1331,32 +1387,23 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
-        req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
-        sequence_lens_tensor = torch.tensor(
-            sequence_lens, dtype=torch.int32, device=q.device
-        )
-        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        kv_locs = metadata.prefill_kv_locs
+        cu_seqlens_k = metadata.prefill_cu_seqlens_k
+        if kv_locs is None or cu_seqlens_k is None:
+            raise RuntimeError("QSA prefill KV metadata is not initialized")
+        if metadata.prefill_max_query_length <= 0:
+            raise RuntimeError("QSA prefill max query length is not initialized")
+        packed_k = k_buffer.index_select(0, kv_locs)
+        packed_v = v_buffer.index_select(0, kv_locs)
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
+            packed_k,
+            packed_v,
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
-            sequence_lens_tensor,
+            metadata.sequence_lengths,
+            metadata.prefill_max_query_length,
             layer.scaling,
         )
         return self._pad_extend_output(output, num_output_rows)
